@@ -17,6 +17,8 @@
 #import <AsyncDisplayKit/ASInternalHelpers.h>
 #import <AsyncDisplayKit/ASHashing.h>
 
+#import <pthread/pthread.h>
+
 const CGSize ASTextContainerMaxSize = (CGSize){0x100000, 0x100000};
 
 typedef struct {
@@ -86,7 +88,7 @@ static CGColorRef ASTextGetCGColor(CGColorRef color) {
 @implementation ASTextContainer {
   @package
   BOOL _readonly; ///< used only in ASTextLayout.implementation
-  dispatch_semaphore_t _lock;
+  pthread_mutex_t _lock;
   
   CGSize _size;
   UIEdgeInsets _insets;
@@ -121,14 +123,19 @@ static CGColorRef ASTextGetCGColor(CGColorRef color) {
 - (instancetype)init {
   self = [super init];
   if (!self) return nil;
-  _lock = dispatch_semaphore_create(1);
+  pthread_mutex_init(&_lock, NULL);
   _pathFillEvenOdd = YES;
   return self;
 }
 
+- (void)dealloc
+{
+  pthread_mutex_destroy(&_lock);
+}
+
 - (id)copyWithZone:(NSZone *)zone {
   ASTextContainer *one = [self.class new];
-  dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
+  pthread_mutex_lock(&_lock);
   one->_size = _size;
   one->_insets = _insets;
   one->_path = _path;
@@ -140,7 +147,7 @@ static CGColorRef ASTextGetCGColor(CGColorRef color) {
   one->_truncationType = _truncationType;
   one->_truncationToken = _truncationToken.copy;
   one->_linePositionModifier = [(NSObject *)_linePositionModifier copy];
-  dispatch_semaphore_signal(_lock);
+  pthread_mutex_unlock(&_lock);
   return one;
 }
 
@@ -182,9 +189,9 @@ static CGColorRef ASTextGetCGColor(CGColorRef color) {
 }
 
 #define Getter(...) \
-dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER); \
+pthread_mutex_lock(&_lock); \
 __VA_ARGS__; \
-dispatch_semaphore_signal(_lock);
+pthread_mutex_unlock(&_lock);
 
 #define Setter(...) \
 if (_readonly) { \
@@ -192,9 +199,9 @@ if (_readonly) { \
 reason:@"Cannot change the property of the 'container' in 'ASTextLayout'." userInfo:nil]; \
 return; \
 } \
-dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER); \
+pthread_mutex_lock(&_lock); \
 __VA_ARGS__; \
-dispatch_semaphore_signal(_lock);
+pthread_mutex_unlock(&_lock);
 
 - (CGSize)size {
   Getter(CGSize size = _size) return size;
@@ -310,7 +317,7 @@ dispatch_semaphore_signal(_lock);
 
 - (NSUInteger)hashIncludingSize:(BOOL)includeSize
 {
-  dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
+  pthread_mutex_lock(&_lock);
 #pragma clang diagnostic push
 #pragma clang diagnostic warning "-Wpadded"
   struct {
@@ -339,7 +346,7 @@ dispatch_semaphore_signal(_lock);
     _insets,
     _linePositionModifier.hash
   };
-  dispatch_semaphore_signal(_lock);
+  pthread_mutex_unlock(&_lock);
   return ASHashBytes(&data, sizeof(data));
 }
 

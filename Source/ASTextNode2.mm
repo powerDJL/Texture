@@ -32,16 +32,17 @@
 #import <AsyncDisplayKit/ASObjectDescriptionHelpers.h>
 #import <AsyncDisplayKit/ASTextLayout.h>
 
-@interface ASTextCacheKey : NSObject {
-  NSAttributedString *_attributedString;
-  ASTextContainer *_container;
-}
+@interface ASTextCacheKey : NSObject
 
+/// The container you pass in will not be copied. The attributedString however will be.
 - (instancetype)initWithContainer:(ASTextContainer *)container attributedString:(NSAttributedString *)attributedString;
 
 // nil if we don't have a layout yet.
 // non-null for entries stored in the cache.
 @property (atomic) ASTextLayout *layout;
+
+@property (atomic, readonly) NSAttributedString *attributedString;
+@property (atomic, readonly) ASTextContainer *container;
 
 @property (atomic) NSUInteger cachedHash;
 
@@ -54,7 +55,7 @@
   if (self = [super init]) {
     _container = container;
     _attributedString = [attributedString copy];
-    _cachedHash = NSUIntegerMax;
+    self.cachedHash = NSUIntegerMax;
   }
   return self;
 }
@@ -74,8 +75,8 @@
     size_t containerHash;
 #pragma clang diagnostic pop
   } data = {
-    _attributedString.hash,
-    [_container hashIncludingSize:NO],
+    self.attributedString.hash,
+    [self.container hashIncludingSize:NO],
   };
   NSUInteger result = ASHashBytes(&data, sizeof(data));
   self.cachedHash = result;
@@ -93,10 +94,10 @@
   ASTextLayout *layout = self.layout;
   if (layout) {
     // We have the layout, the other key is the one we're trying to get a layout for.
-    return [layout isCompatibleWithContainer:otherKey->_container text:otherKey->_attributedString];
+    return [layout isCompatibleWithContainer:otherKey.container text:otherKey.attributedString];
   } else {
     // They have the layout, we are the one trying to get a layout.
-    return [otherKey.layout isCompatibleWithContainer:_container text:_attributedString];
+    return [otherKey.layout isCompatibleWithContainer:self.container text:self.attributedString];
   }
 }
 
@@ -136,6 +137,7 @@ static NSString *ASTextNodeTruncationTokenAttributeName = @"ASTextNodeTruncation
   
   NSAttributedString *_attributedText;
   NSAttributedString *_composedTruncationText;
+  NSAttributedString *_preparedAttributedText;
   NSArray<NSNumber *> *_pointSizeScaleFactors;
   
   NSString *_highlightedLinkAttributeName;
@@ -289,13 +291,10 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
   ASDisplayNodeAssert(constrainedSize.height >= 0, @"Constrained height for text (%f) is too short", constrainedSize.height);
   
   ASTextContainer *container = [_textContainer copy];
-  NSAttributedString *attributedText = self.attributedText;
   container.size = constrainedSize;
   [self _ensureTruncationText];
   
-  NSMutableAttributedString *mutableText = [attributedText mutableCopy] ?: [[NSMutableAttributedString alloc] init];
-  [self prepareAttributedString:mutableText];
-  ASTextLayout *layout = [ASTextNode2 compatibleLayoutWithContainer:container text:mutableText];
+  ASTextLayout *layout = [ASTextNode2 compatibleLayoutWithContainer:container text:[self preparedAttributedText]];
   
   [self setNeedsDisplay];
   
@@ -340,6 +339,7 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
     }
     
     _attributedText = attributedText;
+    _preparedAttributedText = nil;
 #if AS_TEXTNODE2_RECORD_ATTRIBUTED_STRINGS
     [ASTextNode _registerAttributedText:_attributedText];
 #endif
@@ -381,10 +381,18 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
   return _textContainer.exclusionPaths;
 }
 
-- (void)prepareAttributedString:(NSMutableAttributedString *)attributedString
+- (NSAttributedString *)preparedAttributedText
 {
   ASDN::MutexLocker lock(__instanceLock__);
+  if (_preparedAttributedText) {
+    return _preparedAttributedText;
+  }
+  
+  if (!_attributedText) {
+    return [[NSAttributedString alloc] init];
+  }
  
+  NSMutableAttributedString *attributedString = [_attributedText mutableCopy];
   // Apply paragraph style if needed
   [attributedString enumerateAttribute:NSParagraphStyleAttributeName inRange:NSMakeRange(0, attributedString.length) options:kNilOptions usingBlock:^(NSParagraphStyle *style, NSRange range, BOOL * _Nonnull stop) {
     if (style == nil || style.lineBreakMode == _truncationMode) {
@@ -408,6 +416,8 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
     shadow.shadowBlurRadius = _shadowRadius;
     [attributedString addAttribute:NSShadowAttributeName value:shadow range:NSMakeRange(0, attributedString.length)];
   }
+  _preparedAttributedText = [attributedString copy];
+  return _preparedAttributedText;
 }
 
 #pragma mark - Drawing
@@ -417,13 +427,10 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
   [self _ensureTruncationText];
   ASTextContainer *copiedContainer = [_textContainer copy];
   copiedContainer.size = self.bounds.size;
-  NSMutableAttributedString *mutableText = [self.attributedText mutableCopy] ?: [[NSMutableAttributedString alloc] init];
-  
-  [self prepareAttributedString:mutableText];
   
   return @{
            @"container": copiedContainer,
-           @"text": mutableText,
+           @"text": [self preparedAttributedText],
            @"bgColor": self.backgroundColor
            };
 }
@@ -431,14 +438,14 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
 /**
  * If it can't find a compatible layout, this method creates one.
  *
- * NOTE: Be careful to copy `text` if needed.
+ * NOTE: The `container` you pass into this should be a copy, as it may be
+ * retained by the cache in the event of a cache miss.
  */
 + (ASTextLayout *)compatibleLayoutWithContainer:(ASTextContainer *)container
                                            text:(NSAttributedString *)text
 
 {
   // Allocate layoutCacheLock on the heap to prevent destruction at app exit (https://github.com/TextureGroup/Texture/issues/136)
-  static ASDN::StaticMutex& layoutCacheLock = *new ASDN::StaticMutex;
   static NSCache<ASTextCacheKey *, ASTextLayout *> *textLayoutCache;
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
@@ -449,7 +456,6 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
   
   ASTextCacheKey *key = [[ASTextCacheKey alloc] initWithContainer:container attributedString:text];
   
-  ASDN::StaticMutexLocker lock(layoutCacheLock);
   ASTextLayout *layout = [textLayoutCache objectForKey:key];
   if (!layout) {
     layout = [ASTextLayout layoutWithContainer:container text:text];
