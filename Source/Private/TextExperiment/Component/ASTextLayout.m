@@ -13,7 +13,9 @@
 #import <AsyncDisplayKit/ASTextUtilities.h>
 #import <AsyncDisplayKit/ASTextAttribute.h>
 #import <AsyncDisplayKit/NSAttributedString+ASText.h>
+#import <AsyncDisplayKit/ASEqualityHelpers.h>
 #import <AsyncDisplayKit/ASInternalHelpers.h>
+#import <AsyncDisplayKit/ASHashing.h>
 
 const CGSize ASTextContainerMaxSize = (CGSize){0x100000, 0x100000};
 
@@ -99,18 +101,18 @@ static CGColorRef ASTextGetCGColor(CGColorRef color) {
   id<ASTextLinePositionModifier> _linePositionModifier;
 }
 
-+ (instancetype)containerWithSize:(CGSize)size {
++ (instancetype)containerWithSize:(CGSize)size NS_RETURNS_RETAINED {
   return [self containerWithSize:size insets:UIEdgeInsetsZero];
 }
 
-+ (instancetype)containerWithSize:(CGSize)size insets:(UIEdgeInsets)insets {
++ (instancetype)containerWithSize:(CGSize)size insets:(UIEdgeInsets)insets NS_RETURNS_RETAINED {
   ASTextContainer *one = [self new];
   one.size = ASTextClipCGSize(size);
   one.insets = insets;
   return one;
 }
 
-+ (instancetype)containerWithPath:(UIBezierPath *)path {
++ (instancetype)containerWithPath:(UIBezierPath *)path NS_RETURNS_RETAINED {
   ASTextContainer *one = [self new];
   one.path = path;
   return one;
@@ -301,12 +303,44 @@ dispatch_semaphore_signal(_lock);
   Getter(id<ASTextLinePositionModifier> m = _linePositionModifier) return m;
 }
 
-- (NSUInteger)hashWithoutConstrainedSize
+- (NSUInteger)hash
 {
-  // TODO: We could incorporate more of the object in here,
-  // but NSObject's hash (based on the pointer) is OK for now
-  // in terms of correctness.
-  return [super hash];
+  return [self hashIncludingSize:YES];
+}
+
+- (NSUInteger)hashIncludingSize:(BOOL)includeSize
+{
+  dispatch_semaphore_wait(_lock, DISPATCH_TIME_FOREVER);
+#pragma clang diagnostic push
+#pragma clang diagnostic warning "-Wpadded"
+  struct {
+    CGSize size;
+    ASTextTruncationType truncationType;
+    NSUInteger truncationTokenHash;
+    NSUInteger maximumNumberOfRows;
+    NSUInteger verticalForm;
+    CGFloat pathLineWidth;
+    NSUInteger pathFillEvenOdd;
+    NSUInteger exclusionPathsHash;
+    NSUInteger pathHash;
+    UIEdgeInsets insets;
+    NSUInteger linePositionModifierHash;
+#pragma clang diagnostic pop
+  } data = {
+    includeSize ? _size : CGSizeZero,
+    _truncationType,
+    _truncationToken.hash,
+    _maximumNumberOfRows,
+    (NSUInteger)_verticalForm,
+    _pathLineWidth,
+    (NSUInteger)_pathFillEvenOdd,
+    _exclusionPaths.hash,
+    _path.hash,
+    _insets,
+    _linePositionModifier.hash
+  };
+  dispatch_semaphore_signal(_lock);
+  return ASHashBytes(&data, sizeof(data));
 }
 
 #undef Getter
@@ -406,7 +440,7 @@ dispatch_semaphore_signal(_lock);
   if (lineRowsIndex) free(lineRowsIndex); \
   return nil; }
   
-  text = text.mutableCopy;
+  text = text.copy;
   container = container.copy;
   if (!text || !container) return nil;
   if (range.location + range.length > text.length) return nil;
@@ -3356,6 +3390,52 @@ static void ASTextDrawDebug(ASTextLayout *layout, CGContextRef context, CGSize s
                  size:(CGSize)size
                 debug:(ASTextDebugOption *)debug {
   [self drawInContext:context size:size point:CGPointZero view:nil layer:nil debug:debug cancel:nil];
+}
+
+- (BOOL)isCompatibleWithContainer:(ASTextContainer *)otherContainer text:(NSAttributedString *)otherText
+{
+  // Text must be the same.
+  if (![_text isEqualToAttributedString:otherText]) {
+    return NO;
+  }
+  
+  CGRect containerBounds = (CGRect){ .size = _container.size };
+  CGSize layoutSize = self.textBoundingSize;
+  // 1. CoreText can return frames that are narrower than the constrained width, for obvious reasons.
+  // 2. CoreText can return frames that are slightly wider than the constrained width, for some reason.
+  //    We have to trust that somehow it's OK to try and draw within our size constraint, despite the return value.
+  // 3. Thus, those two values (constrained width & returned width) form a range, where
+  //    intermediate values in that range will be snapped. Thus, we can use a given layout as long as our
+  //    width is in that range, between the min and max of those two values.
+  CGRect minRect = CGRectMake(0, 0, MIN(layoutSize.width, containerBounds.size.width), MIN(layoutSize.height, containerBounds.size.height));
+  if (!CGRectContainsRect(containerBounds, minRect)) {
+    return NO;
+  }
+  CGRect maxRect = CGRectMake(0, 0, MAX(layoutSize.width, containerBounds.size.width), MAX(layoutSize.height, containerBounds.size.height));
+  if (!CGRectContainsRect(maxRect, containerBounds)) {
+    return NO;
+  }
+  
+  // Now check container params.
+  if (!UIEdgeInsetsEqualToEdgeInsets(_container.insets, otherContainer.insets)) {
+    return NO;
+  }
+  if (!ASObjectIsEqual(_container.exclusionPaths, otherContainer.exclusionPaths)) {
+    return NO;
+  }
+  if (!ASObjectIsEqual(_container.path, otherContainer.path)) {
+    return NO;
+  }
+  if (_container.maximumNumberOfRows != otherContainer.maximumNumberOfRows) {
+    return NO;
+  }
+  if (_container.truncationType != otherContainer.truncationType) {
+    return NO;
+  }
+  if (!ASObjectIsEqual(_container.truncationToken, otherContainer.truncationToken)) {
+    return NO;
+  }
+  return YES;
 }
 
 @end

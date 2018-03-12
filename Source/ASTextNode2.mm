@@ -35,13 +35,16 @@
 @interface ASTextCacheKey : NSObject {
   NSAttributedString *_attributedString;
   ASTextContainer *_container;
-  
-  // nil if we don't have a layout yet.
-  // non-null for entries stored in the cache.
-  ASTextLayout *_layout;
 }
 
 - (instancetype)initWithContainer:(ASTextContainer *)container attributedString:(NSAttributedString *)attributedString;
+
+// nil if we don't have a layout yet.
+// non-null for entries stored in the cache.
+@property (atomic) ASTextLayout *layout;
+
+@property (atomic) NSUInteger cachedHash;
+
 @end
 
 @implementation ASTextCacheKey
@@ -51,12 +54,18 @@
   if (self = [super init]) {
     _container = container;
     _attributedString = [attributedString copy];
+    _cachedHash = NSUIntegerMax;
   }
   return self;
 }
 
 - (NSUInteger)hash
 {
+  NSUInteger cached = self.cachedHash;
+  if (cached != NSUIntegerMax) {
+    return cached;
+  }
+  
   // Don't include size in hash. Size -> layout mapping is many-to-one (fuzzy).
 #pragma clang diagnostic push
 #pragma clang diagnostic warning "-Wpadded"
@@ -65,10 +74,12 @@
     size_t containerHash;
 #pragma clang diagnostic pop
   } data = {
-    [_attributedString hash],
-    _container.hashWithoutConstrainedSize
+    _attributedString.hash,
+    [_container hashIncludingSize:NO],
   };
-  return ASHashBytes(&data, sizeof(data));
+  NSUInteger result = ASHashBytes(&data, sizeof(data));
+  self.cachedHash = result;
+  return result;
 }
 
 - (BOOL)isEqual:(id)object
@@ -78,45 +89,17 @@
     return NO;
   }
   
-  NSCAssert(!(_layout && otherKey->_layout), @"Should only compare incomplete layout with complete layout!");
-  ASTextLayout *layout = _layout ?: otherKey->_layout;
-  
-  CGRect containerBounds = (CGRect){ .size = _container.size };
-  CGSize layoutSize = layout.textBoundingSize;
-  // 1. CoreText can return frames that are narrower than the constrained width, for obvious reasons.
-  // 2. CoreText can return frames that are slightly wider than the constrained width, for some reason.
-  //    We have to trust that somehow it's OK to try and draw within our size constraint, despite the return value.
-  // 3. Thus, those two values (constrained width & returned width) form a range, where
-  //    intermediate values in that range will be snapped. Thus, we can use a given layout as long as our
-  //    width is in that range, between the min and max of those two values.
-  CGRect minRect = CGRectMake(0, 0, MIN(layoutSize.width, containerBounds.size.width), MIN(layoutSize.height, containerBounds.size.height));
-  if (!CGRectContainsRect(containerBounds, minRect)) {
-    return NO;
+
+  ASTextLayout *layout = self.layout;
+  if (layout) {
+    // We have the layout, the other key is the one we're trying to get a layout for.
+    return [layout isCompatibleWithContainer:otherKey->_container text:otherKey->_attributedString];
+  } else {
+    // They have the layout, we are the one trying to get a layout.
+    return [otherKey.layout isCompatibleWithContainer:_container text:_attributedString];
   }
-  CGRect maxRect = CGRectMake(0, 0, MAX(layoutSize.width, containerBounds.size.width), MAX(layoutSize.height, containerBounds.size.height));
-  if (!CGRectContainsRect(maxRect, containerBounds)) {
-    return NO;
-  }
-  
-  // Now check container params.
-  ASTextContainer *otherContainer = layout.container;
-  if (!UIEdgeInsetsEqualToEdgeInsets(_container.insets, otherContainer.insets)) {
-    return NO;
-  }
-  if (!ASObjectIsEqual(_container.exclusionPaths, otherContainer.exclusionPaths)) {
-    return NO;
-  }
-  if (_container.maximumNumberOfRows != otherContainer.maximumNumberOfRows) {
-    return NO;
-  }
-  if (_container.truncationType != otherContainer.truncationType) {
-    return NO;
-  }
-  if (!ASObjectIsEqual(_container.truncationToken, otherContainer.truncationToken)) {
-    return NO;
-  }
-  return YES;
 }
+
 @end
 
 /**
@@ -460,6 +443,7 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
     textLayoutCache = [[NSCache alloc] init];
+    textLayoutCache.name = @"org.TextureGroup.Texture.TextNode2LayoutCache";
   });
 
   
@@ -469,6 +453,7 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
   ASTextLayout *layout = [textLayoutCache objectForKey:key];
   if (!layout) {
     layout = [ASTextLayout layoutWithContainer:container text:text];
+    key.layout = layout;
     [textLayoutCache setObject:layout forKey:key];
   }
   return layout;
