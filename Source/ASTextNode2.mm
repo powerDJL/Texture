@@ -310,7 +310,7 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
   container.size = constrainedSize;
   [self _ensureTruncationText];
   
-  NSMutableAttributedString *mutableText = [attributedText mutableCopy];
+  NSMutableAttributedString *mutableText = [attributedText mutableCopy] ?: [[NSMutableAttributedString alloc] init];
   [self prepareAttributedString:mutableText];
   ASTextLayout *layout = [ASTextNode2 compatibleLayoutWithContainer:container text:mutableText];
   
