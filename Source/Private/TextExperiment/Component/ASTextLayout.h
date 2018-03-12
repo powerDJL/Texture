@@ -96,6 +96,10 @@ extern const CGSize ASTextContainerMaxSize;
 /// This modifier is applied to the lines before the layout is completed,
 /// give you a chance to modify the line position. Default is nil.
 @property (nullable, copy) id<ASTextLinePositionModifier> linePositionModifier;
+
+/// The hash of this container, without the constrained size.
+@property (atomic, readonly) NSUInteger hashWithoutConstrainedSize;
+
 @end
 
 

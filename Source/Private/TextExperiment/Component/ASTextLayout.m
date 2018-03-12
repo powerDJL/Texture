@@ -301,6 +301,14 @@ dispatch_semaphore_signal(_lock);
   Getter(id<ASTextLinePositionModifier> m = _linePositionModifier) return m;
 }
 
+- (NSUInteger)hashWithoutConstrainedSize
+{
+  // TODO: We could incorporate more of the object in here,
+  // but NSObject's hash (based on the pointer) is OK for now
+  // in terms of correctness.
+  return [super hash];
+}
+
 #undef Getter
 #undef Setter
 @end

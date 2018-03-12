@@ -66,7 +66,7 @@
 #pragma clang diagnostic pop
   } data = {
     [_attributedString hash],
-    [_container hash]
+    _container.hashWithoutConstrainedSize
   };
   return ASHashBytes(&data, sizeof(data));
 }
