@@ -13,7 +13,6 @@
 #import <AsyncDisplayKit/ASTextUtilities.h>
 #import <AsyncDisplayKit/ASTextAttribute.h>
 #import <AsyncDisplayKit/NSAttributedString+ASText.h>
-#import <AsyncDisplayKit/ASHashing.h>
 #import <AsyncDisplayKit/ASInternalHelpers.h>
 
 const CGSize ASTextContainerMaxSize = (CGSize){0x100000, 0x100000};
@@ -300,40 +299,6 @@ dispatch_semaphore_signal(_lock);
 
 - (id<ASTextLinePositionModifier>)linePositionModifier {
   Getter(id<ASTextLinePositionModifier> m = _linePositionModifier) return m;
-}
-
-#pragma mark - Hashing
-
-- (NSUInteger)hash
-{
-  // Don't include size in hash. Size -> layout mapping is many-to-one (fuzzy).
-#pragma clang diagnostic push
-#pragma clang diagnostic warning "-Wpadded"
-  struct {
-    UIEdgeInsets _insets;
-    NSUInteger _pathHash;
-    NSUInteger _exclusionPathsHash;
-    BOOL _pathFillEvenOdd;
-    CGFloat _pathLineWidth;
-    BOOL _verticalForm;
-    NSUInteger _maximumNumberOfRows;
-    ASTextTruncationType _truncationType;
-    NSUInteger _truncationTokenHash;
-    NSUInteger _linePositionModifierHash;
-#pragma clang diagnostic pop
-  } data = {
-    _insets,
-    [_path hash],
-    _exclusionPaths.hash,
-    _pathFillEvenOdd,
-    _pathLineWidth,
-    self.verticalForm,
-    _maximumNumberOfRows,
-    _truncationType,
-    [self.truncationToken hash],
-    [self.linePositionModifier hash]
-  };
-  return ASHashBytes(&data, sizeof(data));
 }
 
 #undef Getter
