@@ -18,6 +18,7 @@
 
 #import <AsyncDisplayKit/_ASDisplayLayer.h>
 #import <AsyncDisplayKit/ASDisplayNode+FrameworkSubclasses.h>
+#import <AsyncDisplayKit/ASHashing.h>
 #import <AsyncDisplayKit/ASHighlightOverlayLayer.h>
 #import <AsyncDisplayKit/ASDisplayNodeExtras.h>
 
@@ -31,13 +32,91 @@
 #import <AsyncDisplayKit/ASObjectDescriptionHelpers.h>
 #import <AsyncDisplayKit/ASTextLayout.h>
 
-@interface ASTextCacheValue : NSObject {
-  @package
-  ASDN::Mutex _m;
-  std::deque<std::tuple<CGSize, ASTextLayout *>> _layouts;
+@interface ASTextCacheKey : NSObject {
+  NSAttributedString *_attributedString;
+  ASTextContainer *_container;
+  
+  // nil if we don't have a layout yet.
+  // non-null for entries stored in the cache.
+  ASTextLayout *_layout;
 }
+
+- (instancetype)initWithContainer:(ASTextContainer *)container attributedString:(NSAttributedString *)attributedString;
 @end
-@implementation ASTextCacheValue
+
+@implementation ASTextCacheKey
+
+- (instancetype)initWithContainer:(ASTextContainer *)container attributedString:(NSAttributedString *)attributedString
+{
+  if (self = [super init]) {
+    _container = container;
+    _attributedString = [attributedString copy];
+  }
+  return self;
+}
+
+- (NSUInteger)hash
+{
+  // Don't include size in hash. Size -> layout mapping is many-to-one (fuzzy).
+#pragma clang diagnostic push
+#pragma clang diagnostic warning "-Wpadded"
+  struct {
+    size_t attributedStringHash;
+    size_t containerHash;
+#pragma clang diagnostic pop
+  } data = {
+    [_attributedString hash],
+    [_container hash]
+  };
+  return ASHashBytes(&data, sizeof(data));
+}
+
+- (BOOL)isEqual:(id)object
+{
+  ASTextCacheKey *otherKey = ASDynamicCast(object, ASTextCacheKey);
+  if (!otherKey) {
+    return NO;
+  }
+  
+  NSCAssert(!(_layout && otherKey->_layout), @"Should only compare incomplete layout with complete layout!");
+  ASTextLayout *layout = _layout ?: otherKey->_layout;
+  
+  CGRect containerBounds = (CGRect){ .size = _container.size };
+  CGSize layoutSize = layout.textBoundingSize;
+  // 1. CoreText can return frames that are narrower than the constrained width, for obvious reasons.
+  // 2. CoreText can return frames that are slightly wider than the constrained width, for some reason.
+  //    We have to trust that somehow it's OK to try and draw within our size constraint, despite the return value.
+  // 3. Thus, those two values (constrained width & returned width) form a range, where
+  //    intermediate values in that range will be snapped. Thus, we can use a given layout as long as our
+  //    width is in that range, between the min and max of those two values.
+  CGRect minRect = CGRectMake(0, 0, MIN(layoutSize.width, containerBounds.size.width), MIN(layoutSize.height, containerBounds.size.height));
+  if (!CGRectContainsRect(containerBounds, minRect)) {
+    return NO;
+  }
+  CGRect maxRect = CGRectMake(0, 0, MAX(layoutSize.width, containerBounds.size.width), MAX(layoutSize.height, containerBounds.size.height));
+  if (!CGRectContainsRect(maxRect, containerBounds)) {
+    return NO;
+  }
+  
+  // Now check container params.
+  ASTextContainer *otherContainer = layout.container;
+  if (!UIEdgeInsetsEqualToEdgeInsets(_container.insets, otherContainer.insets)) {
+    return NO;
+  }
+  if (!ASObjectIsEqual(_container.exclusionPaths, otherContainer.exclusionPaths)) {
+    return NO;
+  }
+  if (_container.maximumNumberOfRows != otherContainer.maximumNumberOfRows) {
+    return NO;
+  }
+  if (_container.truncationType != otherContainer.truncationType) {
+    return NO;
+  }
+  if (!ASObjectIsEqual(_container.truncationToken, otherContainer.truncationToken)) {
+    return NO;
+  }
+  return YES;
+}
 @end
 
 /**
@@ -377,81 +456,21 @@ static NSArray *DefaultLinkAttributeNames = @[ NSLinkAttributeName ];
 {
   // Allocate layoutCacheLock on the heap to prevent destruction at app exit (https://github.com/TextureGroup/Texture/issues/136)
   static ASDN::StaticMutex& layoutCacheLock = *new ASDN::StaticMutex;
-  static NSCache<NSAttributedString *, ASTextCacheValue *> *textLayoutCache;
+  static NSCache<ASTextCacheKey *, ASTextLayout *> *textLayoutCache;
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
     textLayoutCache = [[NSCache alloc] init];
   });
+
   
-  ASTextCacheValue *cacheValue = ({
-    ASDN::StaticMutexLocker lock(layoutCacheLock);
-    cacheValue = [textLayoutCache objectForKey:text];
-    if (cacheValue == nil) {
-      cacheValue = [[ASTextCacheValue alloc] init];
-      [textLayoutCache setObject:cacheValue forKey:[text copy]];
-    }
-    cacheValue;
-  });
+  ASTextCacheKey *key = [[ASTextCacheKey alloc] initWithContainer:container attributedString:text];
   
-  CGRect containerBounds = (CGRect){ .size = container.size };
-  {
-    ASDN::MutexLocker lock(cacheValue->_m);
-    for (auto &t : cacheValue->_layouts) {
-      CGSize constrainedSize = std::get<0>(t);
-      ASTextLayout *layout = std::get<1>(t);
-      
-      CGSize layoutSize = layout.textBoundingSize;
-      // 1. CoreText can return frames that are narrower than the constrained width, for obvious reasons.
-      // 2. CoreText can return frames that are slightly wider than the constrained width, for some reason.
-      //    We have to trust that somehow it's OK to try and draw within our size constraint, despite the return value.
-      // 3. Thus, those two values (constrained width & returned width) form a range, where
-      //    intermediate values in that range will be snapped. Thus, we can use a given layout as long as our
-      //    width is in that range, between the min and max of those two values.
-      CGRect minRect = CGRectMake(0, 0, MIN(layoutSize.width, constrainedSize.width), MIN(layoutSize.height, constrainedSize.height));
-      if (!CGRectContainsRect(containerBounds, minRect)) {
-        continue;
-      }
-      CGRect maxRect = CGRectMake(0, 0, MAX(layoutSize.width, constrainedSize.width), MAX(layoutSize.height, constrainedSize.height));
-      if (!CGRectContainsRect(maxRect, containerBounds)) {
-        continue;
-      }
-      
-      // Now check container params.
-      ASTextContainer *otherContainer = layout.container;
-      if (!UIEdgeInsetsEqualToEdgeInsets(container.insets, otherContainer.insets)) {
-        continue;
-      }
-      if (!ASObjectIsEqual(container.exclusionPaths, otherContainer.exclusionPaths)) {
-        continue;
-      }
-      if (container.maximumNumberOfRows != otherContainer.maximumNumberOfRows) {
-        continue;
-      }
-      if (container.truncationType != otherContainer.truncationType) {
-        continue;
-      }
-      if (!ASObjectIsEqual(container.truncationToken, otherContainer.truncationToken)) {
-        continue;
-      }
-      // TODO: When we get a cache hit, move this entry to the front (LRU).
-      return layout;
-    }
+  ASDN::StaticMutexLocker lock(layoutCacheLock);
+  ASTextLayout *layout = [textLayoutCache objectForKey:key];
+  if (!layout) {
+    layout = [ASTextLayout layoutWithContainer:container text:text];
+    [textLayoutCache setObject:layout forKey:key];
   }
-  
-  // Cache Miss.
-  
-  // Compute the text layout.
-  ASTextLayout *layout = [ASTextLayout layoutWithContainer:container text:text];
-  
-  // Store the result in the cache.
-  {
-    ASDN::MutexLocker lock(cacheValue->_m);
-    cacheValue->_layouts.push_front(std::make_tuple(container.size, layout));
-    if (cacheValue->_layouts.size() > 3) {
-      cacheValue->_layouts.pop_back();
-    }
-  }
-  
   return layout;
 }
 
